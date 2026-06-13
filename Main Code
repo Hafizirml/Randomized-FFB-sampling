@@ -1,0 +1,391 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <HX711.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ESP32Servo.h>
+
+// ==========================================
+//           NETWORK CONFIGURATION
+// ==========================================
+const char* ssid = "";                  
+const char* password = "";              
+const char* google_script_url = "-"; 
+
+// Timing Config
+unsigned long lastSendMillis = 0;
+const unsigned long sendInterval = 5000;             
+const unsigned long dropWaitInterval = 4000;         
+
+// Sleep/Inactivity Config
+unsigned long lastActivityMillis = 0; 
+const unsigned long INACTIVITY_TIMEOUT = 300000;     // 5 minutes before entering deep sleep mode
+
+// ==========================================
+//        HARDWARE PIN MAPS (WORKING PINS)
+// ==========================================
+const int I2C_SDA = 17; 
+const int I2C_SCL = 18; 
+
+const int LOADCELL_DOUT_PIN = 13; 
+const int LOADCELL_SCK_PIN = 12;  
+
+const int START_STOP_BUTTON = 1; 
+const int CALIBRATE_BUTTON = 2;   
+
+const int RED_LED_PIN = 15;      
+const int GREEN_LED_PIN = 16;    
+
+const int SERVO_360_PIN = 6;    
+const int SERVO_180_PIN = 7;    
+
+// ==========================================
+//          SYSTEM VARIABLE LOGIC
+// ==========================================
+bool isSystemRunning = false; 
+int nullCounter = 0;
+const int MAX_NULL_ATTEMPTS = 10;                 
+const float SIGNIFICANT_WEIGHT_THRESHOLD = 0.500; 
+
+unsigned long batchStartMillis = 0;                
+
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+HX711 scale;
+float calibration_factor = -615.5; 
+
+Servo servo360;
+Servo servo180;
+
+// ==========================================
+//          DYNAMIC OLED UI DISPATCHER
+// ==========================================
+void updateDisplay(float val, String status, int countdown) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("PALM GRADING SYSTEM");
+  display.drawLine(0, 9, 128, 9, SSD1306_WHITE);
+  
+  if (isSystemRunning) {
+    display.setTextSize(2);
+    display.setCursor(0, 18);
+    display.print(val, 3);
+    display.print(" g");
+    
+    display.setTextSize(1);
+    display.setCursor(0, 42);
+    display.print(status);
+    
+    display.setCursor(0, 55);
+    if (countdown > 0) {
+      display.print("Time: ");
+      display.print(countdown);
+      display.print("s  ");
+    } else {
+      display.print("Syncing... ");
+    }
+    display.print("N:");
+    display.print(nullCounter);
+  } else {
+    display.setTextSize(2);
+    display.setCursor(0, 18);
+    display.print("SYSTEM IDLE");
+    
+    display.setTextSize(1);
+    display.setCursor(0, 38);
+    display.print("Btn 1: Start System");
+    display.setCursor(0, 48);
+    display.print("Btn 2: Calibrate");
+    
+    long remainingSleepSec = (INACTIVITY_TIMEOUT - (millis() - lastActivityMillis)) / 1000;
+    if (remainingSleepSec < 0) remainingSleepSec = 0;
+    display.setCursor(0, 56);
+    display.print("Sleep in: ");
+    display.print(remainingSleepSec);
+    display.print("s");
+  }
+  
+  display.setCursor(102, 0);
+  display.print((WiFi.status() == WL_CONNECTED) ? "[OK]" : "[!!]");
+  display.display();
+}
+
+// ==========================================
+//       TELEMETRY & CLOUD SYNC FUNCTION
+// ==========================================
+void syncOperationToCloud(String operationType, float weightVal, float durationSec) {
+  if (WiFi.status() == WL_CONNECTED) {
+    updateDisplay(weightVal, ">> UPLOADING <<", 0);
+    
+    WiFiClientSecure client; 
+    client.setInsecure(); 
+    
+    HTTPClient http;
+    if (http.begin(client, google_script_url)) {
+      http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); 
+      http.setTimeout(10000); 
+      
+      http.addHeader("Content-Type", "application/json");
+      http.addHeader("Connection", "close"); 
+      
+      String jsonPayload = "{\"operation\":\"" + operationType + 
+                           "\",\"final_weight\":\"" + String(weightVal, 3) + 
+                           "\",\"duration\":\"" + String(durationSec, 1) + "\"}";
+                           
+      int httpCode = http.POST(jsonPayload);
+      
+      if (httpCode > 0) {
+        updateDisplay(weightVal, "SUCCESS!", 0);
+        delay(300); 
+      } else {
+        updateDisplay(weightVal, "CLOUD ERR", 0);
+        delay(500);
+      }
+      http.end(); 
+    }
+  } else {
+    WiFi.begin(ssid, password);
+  }
+}
+
+void rotate360Servo90Degrees() {
+  servo360.write(180);  
+  delay(375);           
+  servo360.write(90);   
+  delay(800);           
+}
+
+// ==========================================
+//    DEEP SLEEP IMMERSION CONTROLLER
+// ==========================================
+void goToDeepSleep() {
+  Serial.println("Inactivity limit reached. Commencing hardware shutdown into Deep Sleep...");
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 20);
+  display.println("ENTERING DEEP SLEEP");
+  display.println("Wake up via Button 1");
+  display.display();
+  delay(2000);
+  
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+  scale.power_down();
+  
+  digitalWrite(RED_LED_PIN, LOW);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  
+  // Set up Button 1 (GPIO 1) as our active hardware interrupt trigger line
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)START_STOP_BUTTON, 0); // 0 means wake up when button goes LOW
+  
+  // Cut system core power completely
+  esp_deep_sleep_start();
+}
+
+// ==========================================
+//             INITIALIZATION SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000); 
+
+  pinMode(RED_LED_PIN, OUTPUT);
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  pinMode(START_STOP_BUTTON, INPUT_PULLUP);
+  pinMode(CALIBRATE_BUTTON, INPUT_PULLUP);
+  
+  // Hard hardware reset trigger line pulse to clear any latent chip latches
+  pinMode(LOADCELL_SCK_PIN, OUTPUT);
+  digitalWrite(LOADCELL_SCK_PIN, HIGH);
+  delayMicroseconds(100);
+  digitalWrite(LOADCELL_SCK_PIN, LOW);
+  delay(100);
+
+  // Check if system woke up from Deep Sleep
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("Woken up from Deep Sleep! Auto-starting system run loop...");
+    isSystemRunning = true;
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    digitalWrite(RED_LED_PIN, LOW);
+  } else {
+    digitalWrite(RED_LED_PIN, HIGH);
+    digitalWrite(GREEN_LED_PIN, LOW);
+  }
+  
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  servo360.attach(SERVO_360_PIN, 500, 2500);
+  servo180.attach(SERVO_180_PIN, 500, 2500);
+  
+  servo180.write(0);
+  servo360.write(90); 
+  
+  Wire.begin(I2C_SDA, I2C_SCL);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.display();
+
+  WiFi.begin(ssid, password);
+  
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale(calibration_factor);
+  
+  scale.power_up();
+  delay(400); // Critical stabilization shield settling delay
+  
+  if(!scale.wait_ready_timeout(1000)) {
+     scale.power_down(); delay(50); scale.power_up(); delay(400);
+  }
+  
+  scale.tare(); 
+  lastActivityMillis = millis(); 
+
+  // If we woke up straight from sleep, jump right into dispensing execution
+  if (isSystemRunning) {
+    nullCounter = 0;
+    updateDisplay(0.0, "Starting...", 0);
+    delay(500); 
+    batchStartMillis = millis(); 
+    rotate360Servo90Degrees();
+    lastSendMillis = millis();
+  }
+}
+
+// ==========================================
+//          MAIN CORE MACHINE LOOP
+// ==========================================
+void loop() {
+  // 1. Process Baseline Calibration (Button 2)
+  if (digitalRead(CALIBRATE_BUTTON) == LOW) {
+    if (!isSystemRunning) {
+      lastActivityMillis = millis(); 
+      scale.power_up();
+      delay(400); 
+      scale.tare();
+      
+      for(int i = 0; i < 3; i++) {
+        digitalWrite(GREEN_LED_PIN, HIGH); delay(150);
+        digitalWrite(GREEN_LED_PIN, LOW); delay(150);
+      }
+    }
+    delay(200);
+  }
+
+  // 2. Process Execution Toggle Handler (Button 1)
+  if (digitalRead(START_STOP_BUTTON) == LOW) {
+    isSystemRunning = !isSystemRunning;
+    lastActivityMillis = millis(); 
+    
+    if (isSystemRunning) {
+      digitalWrite(GREEN_LED_PIN, HIGH);
+      digitalWrite(RED_LED_PIN, LOW);
+      nullCounter = 0;
+      updateDisplay(0.0, "Starting...", 0);
+      delay(500); 
+      
+      scale.power_up();
+      delay(400); 
+      scale.tare(); 
+      
+      batchStartMillis = millis(); 
+      rotate360Servo90Degrees();
+      lastSendMillis = millis(); 
+    } else {
+      digitalWrite(GREEN_LED_PIN, LOW);
+      digitalWrite(RED_LED_PIN, HIGH);
+      updateDisplay(0.0, "Stopping...", 0);
+      
+      float batchTotalDuration = (float)(millis() - batchStartMillis) / 1000.0;
+      syncOperationToCloud("stop", 0.0, batchTotalDuration); 
+      
+      batchStartMillis = 0;
+      nullCounter = 0;
+    }
+    delay(600); 
+  }
+
+  // 3. Automated Operation Cycle Execution Engine
+  if (isSystemRunning) {
+    lastActivityMillis = millis(); 
+    
+    if (digitalRead(START_STOP_BUTTON) == LOW) {
+      isSystemRunning = false;
+      digitalWrite(GREEN_LED_PIN, LOW);
+      digitalWrite(RED_LED_PIN, HIGH);
+      updateDisplay(0.0, "Stopping...", 0);
+      
+      float batchTotalDuration = (float)(millis() - batchStartMillis) / 1000.0;
+      syncOperationToCloud("stop", 0.0, batchTotalDuration);
+      
+      batchStartMillis = 0;
+      nullCounter = 0;
+      delay(600);
+      return;
+    }
+
+    unsigned long startWaitCheck = millis();
+    float currentCheck = 0.00;
+    bool fruitDetected = false;
+
+    while (millis() - startWaitCheck < dropWaitInterval) {
+      if (digitalRead(START_STOP_BUTTON) == LOW) {
+        isSystemRunning = false;
+        digitalWrite(GREEN_LED_PIN, LOW);
+        digitalWrite(RED_LED_PIN, HIGH);
+        updateDisplay(0.0, "Stopping...", 0);
+        
+        float batchTotalDuration = (float)(millis() - batchStartMillis) / 1000.0;
+        syncOperationToCloud("stop", 0.0, batchTotalDuration);
+        
+        batchStartMillis = 0;
+        nullCounter = 0;
+        delay(600);
+        return;
+      }
+
+      if (scale.wait_ready_timeout(150)) {
+         currentCheck = scale.get_units(1); 
+      } else {
+         scale.power_down(); delay(20); scale.power_up(); delay(200);
+      }
+
+      if (currentCheck < 0.00) currentCheck = 0.00;
+      int waitCountdown = (int)(dropWaitInterval - (millis() - startWaitCheck)) / 1000;
+      updateDisplay(currentCheck, "Checking Drop...", waitCountdown);
+
+      if (currentCheck >= SIGNIFICANT_WEIGHT_THRESHOLD) {
+        fruitDetected = true;
+        break; 
+      }   
+      delay(20);
+    }
+
+    if (!fruitDetected) {
+      nullCounter++;
+      if (nullCounter >= MAX_NULL_ATTEMPTS) { 
+        isSystemRunning = false;
+        digitalWrite(GREEN_LED_PIN, LOW);
+        digitalWrite(RED_LED_PIN, HIGH);
+        updateDisplay(0.0, "AUTO-STOP: EMPTY", 0);
+        
+        float batchTotalDuration = (float)(millis() - batchStartMillis) / 1000.0;
+        syncOperationToCloud("stop", 0.0, batchTotalDuration); 
+        
+        batchStartMillis = 0;
+        nullCounter = 0;
+        delay(2500); 
+        return;
+      } else {
+        rotate360Servo90Degrees();
+        lastSendMillis = millis(); 
+      }
+    } else {
+      nullCounter = 0; 
+      float totalWeight = 0;
+      int sampleCount = 0;
+      delay(200); 
+      lastSendMillis
